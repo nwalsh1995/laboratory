@@ -1,5 +1,7 @@
 from copy import deepcopy
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
+from itertools import chain
 import logging
 import random
 import traceback
@@ -10,7 +12,6 @@ from laboratory.result import Result
 
 
 logger = logging.getLogger(__name__)
-
 
 class Experiment(object):
     '''
@@ -32,6 +33,7 @@ class Experiment(object):
         self.name = name
         self._context = context or {}
         self.raise_on_mismatch = raise_on_mismatch
+        self._num_async_candidates = 0
 
         self._control = None
         self._candidates = []
@@ -89,7 +91,7 @@ class Experiment(object):
             'context': context or {},
         }
 
-    def candidate(self, cand_func, args=None, kwargs=None, name='Candidate', context=None):
+    def candidate(self, cand_func, args=None, kwargs=None, name='Candidate', context=None, run_async=False):
         '''
         Adds a candidate function to an experiment. Can be used multiple times for
         multiple candidates.
@@ -99,13 +101,18 @@ class Experiment(object):
         :param dict kwargs: keyword arguments to pass to your function
         :param string name: a name for your observation
         :param dict context: observation-specific context
+        :param bool run_async: whether to run func in a new thread
         '''
+        if run_async:
+            self._num_async_candidates += 1
+
         self._candidates.append({
             'func': cand_func,
             'args': args or [],
             'kwargs': kwargs or {},
             'name': name,
             'context': context or {},
+            'run_async': run_async
         })
 
     def conduct(self, randomize=True):
@@ -123,11 +130,14 @@ class Experiment(object):
                 'Your experiment must contain a control case'
             )
 
-
         # execute control and exit if experiment is not enabled
         if not self.enabled():
             control = self._run_tested_func(raise_on_exception=True, **self._control)
             return control.value
+
+        # create a threadpool if we have to run async functions
+        if self._num_async_candidates != 0:
+            thread_pool = ThreadPoolExecutor(max_workers=self._num_async_candidates)
 
         # otherwise, let's wrap an executor around all of our functions and randomise the ordering
 
@@ -135,18 +145,21 @@ class Experiment(object):
             """A lightweight wrapper around a tested function in order to retrieve state"""
             return lambda *a, **kw: (self._run_tested_func(raise_on_exception=is_control, **obs_def), is_control)
 
-        funcs = [
-            get_func_executor(self._control, is_control=True),
-        ] + [get_func_executor(cand, is_control=False,) for cand in self._candidates]
+        sync_funcs = [get_func_executor(self._control, is_control=True)] + [get_func_executor(cand, is_control=False)
+                                                                            for cand in self._candidates if not
+                                                                            cand["run_async"]]
+        async_funcs = [thread_pool.submit(get_func_executor(cand, is_control=False)).result
+                       for cand in self._candidates if cand["run_async"]]
 
         if randomize:
-            random.shuffle(funcs)
+            random.shuffle(sync_funcs)
 
         control = None
         candidates = []
 
-        # go through the randomised list and execute the functions
-        for func in funcs:
+        # go through the randomised list and execute the functions, making sure to run sync functions first
+        # since the async functions are already running and will block
+        for func in chain(sync_funcs, async_funcs):
             observation, is_control = func()
             if is_control:
                 control = observation
@@ -205,7 +218,7 @@ class Experiment(object):
         '''
         return self._context
 
-    def _run_tested_func(self, func, args, kwargs, name, context, raise_on_exception):
+    def _run_tested_func(self, func, args, kwargs, name, context, raise_on_exception, run_async=False):
         ctx = deepcopy(self.get_context())
         ctx.update(context)
 
